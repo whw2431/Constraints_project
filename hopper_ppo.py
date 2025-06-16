@@ -274,7 +274,9 @@ PRETRAINED_N_HEAD = 4
 PRETRAINED_NUM_ENCODER_LAYERS = 4
 PRETRAINED_DIM_FEEDFORWARD = PRETRAINED_D_MODEL * 4
 PRETRAINED_DROPOUT = 0.1
-
+# IMPORTANT: This script requires a pre-trained model for the correct action dimension.
+# Make sure you have run the SimCLR pre-training script for Hopper (action_dim=3)
+# and the resulting model file is in the same directory.
 PRETRAINED_MODEL_PATH = f"simclr_encoder_action_dim{PRETRAINED_ACTION_DIM}.pth"
 
 PPO_DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")

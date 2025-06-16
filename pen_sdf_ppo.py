@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-pen_ddf_ppo_sdf.py (MODIFIED - FINAL VERSION with a 'good' test constraint to verify hypothesis)
+pen_ddf_ppo_sdf.py (MODIFIED - FINAL VERSION with separate plots per test case)
 """
 
 import numpy as np
@@ -104,10 +104,15 @@ def cfunc_linear_halfspace(x: torch.Tensor, a: torch.Tensor, b: float) -> torch.
 
 def cfunc_box(x: torch.Tensor, low: torch.Tensor, high: torch.Tensor) -> torch.Tensor:
     l_d, h_d = low.to(x.device), high.to(x.device);
-    violations = torch.cat([(x - h_d).unsqueeze(-1), (l_d - x).unsqueeze(-1)], dim=-1) if x.ndim > 1 else torch.cat(
-        [(x - h_d).view(-1, 1), (l_d - x).view(-1, 1)], dim=-1)
+    # Ensure dimensions match for broadcasting if needed
+    if x.ndim > 1 and l_d.ndim == 1:
+        l_d = l_d.unsqueeze(0)
+    if x.ndim > 1 and h_d.ndim == 1:
+        h_d = h_d.unsqueeze(0)
+
+    violations = torch.cat([(x - h_d).unsqueeze(-1), (l_d - x).unsqueeze(-1)], dim=-1)
     max_dim_violations, _ = torch.max(violations, dim=-1)
-    overall_max_violation, _ = torch.max(max_dim_violations, dim=-1)
+    overall_max_violation, _ = torch.max(max_dim_violations, dim=-1, keepdim=False)
     return overall_max_violation
 
 
@@ -376,19 +381,12 @@ class ConvexBall:
             cls._lc[ck] = None;
 
     def project(self, x: torch.Tensor) -> torch.Tensor:
-        # --- MODIFICATION START: Add special, robust handling for 1D case ---
         if self.dim == 1:
             c_on_x_device = self.c.to(x.device)
-            # For a 1D ball (interval), projection is just clamping.
-            # This is numerically exact and avoids solver precision issues.
             low = c_on_x_device - self.r
             high = c_on_x_device + self.r
-            # Ensure x and clamp bounds have compatible shapes for broadcasting
-            # This handles shapes like (B, 1) or (1,) or (B,)
             return torch.clamp(x, min=low.squeeze(), max=high.squeeze())
-        # --- MODIFICATION END ---
 
-        # Original N-D logic remains for dimensions > 1
         if self.dim <= 0: return x
         is_scalar_input_shape = x.ndim == 1;
         xb = x.unsqueeze(0) if is_scalar_input_shape else x
@@ -439,14 +437,10 @@ class ConvexBall:
         return projected_batch.squeeze(0) if is_scalar_input_shape else projected_batch
 
     def violation(self, x: torch.Tensor) -> torch.Tensor:
-        # --- MODIFICATION START: Explicit 1D handling for clarity and robustness ---
         if self.dim == 1:
             c_on_x_device = self.c.to(x.device)
-            # For 1D, norm-2 is just the absolute value.
             return torch.abs(x - c_on_x_device.squeeze()) - self.r
-        # --- MODIFICATION END ---
 
-        # Original logic for N-D
         if self.dim <= 0:
             return torch.tensor(-self.r if self.r > 0 else 0., device=x.device)
 
@@ -481,14 +475,32 @@ class SDFProjector(nn.Module):
         phi_evaluations_list = [];
         valid_sets_for_sdf = []
 
+        # ### MODIFICATION START ###
+        # Added handling for box constraints which do not have a .dim attribute
+        # but have an action_dim in their raw data. For simplicity, we assume
+        # all sets passed here are compatible if they don't have a .dim check.
         for i, constraint_set in enumerate(sets):
-            if hasattr(constraint_set, 'dim') and constraint_set.dim == action_dim_of_a0:
+            is_dim_compatible = False
+            if hasattr(constraint_set, 'dim'):
+                if constraint_set.dim == action_dim_of_a0:
+                    is_dim_compatible = True
+            elif isinstance(constraint_set, dict) and constraint_set.get('type') == 'box':
+                is_dim_compatible = True  # Assume box is compatible for SDF projection
+
+            if is_dim_compatible:
                 try:
-                    violation_values = constraint_set.violation(a0_batched)
+                    # For dict-based constraints like our box, we need to build the cfunc
+                    if isinstance(constraint_set, dict):
+                        cfunc = build_cfunc_from_raw_data(constraint_set, a0.device)
+                        violation_values = cfunc(a0_batched)
+                    else:  # For object-based constraints like ConvexBall
+                        violation_values = constraint_set.violation(a0_batched)
+
                     phi_evaluations_list.append(violation_values)
                     valid_sets_for_sdf.append(constraint_set)
                 except Exception as e:
                     pass
+        # ### MODIFICATION END ###
 
         if not phi_evaluations_list or not valid_sets_for_sdf:
             return a0
@@ -509,6 +521,12 @@ class SDFProjector(nn.Module):
                 closest_set_index = indices_of_min_sets[
                     item_idx].item() if indices_of_min_sets.ndim > 0 else indices_of_min_sets.item()
                 set_to_project_onto = valid_sets_for_sdf[closest_set_index]
+
+                # Cannot project onto a dict representation, so we skip for box
+                if isinstance(set_to_project_onto, dict):
+                    projected_fallback_actions.append(action_item)
+                    continue
+
                 try:
                     projected_fallback_actions.append(set_to_project_onto.project(action_item))
                 except Exception as e_proj_fb:
@@ -521,7 +539,14 @@ class SDFProjector(nn.Module):
 
         phi_evals_for_grad = []
         for s_idx, s_set_instance in enumerate(valid_sets_for_sdf):
-            viol = s_set_instance.violation(a0_for_grad)
+            # ### MODIFICATION START ###
+            # Handle dict-based constraints for gradient calculation too
+            if isinstance(s_set_instance, dict):
+                cfunc_grad = build_cfunc_from_raw_data(s_set_instance, a0_for_grad.device)
+                viol = cfunc_grad(a0_for_grad)
+            else:
+                viol = s_set_instance.violation(a0_for_grad)
+            # ### MODIFICATION END ###
             phi_evals_for_grad.append(viol)
 
         if not phi_evals_for_grad:
@@ -551,7 +576,7 @@ class SDFProjector(nn.Module):
         return projected_a0.squeeze(0) if not is_batched_input and projected_a0.shape[0] == 1 else projected_a0
 
 
-def hard_project_to_union_of_convex_sets(action_raw: torch.Tensor, convex_component_sets: List[ConvexBall],
+def hard_project_to_union_of_convex_sets(action_raw: torch.Tensor, convex_component_sets: List,
                                          device: torch.device) -> torch.Tensor:
     if not convex_component_sets: return action_raw
 
@@ -564,10 +589,16 @@ def hard_project_to_union_of_convex_sets(action_raw: torch.Tensor, convex_compon
         current_single_action = action_batch_input[i].to(device);
         action_dim_of_current = current_single_action.shape[0]
 
-        compatible_component_sets = [
-            comp_set for comp_set in convex_component_sets
-            if hasattr(comp_set, 'dim') and comp_set.dim == action_dim_of_current
-        ]
+        # ### MODIFICATION START ###
+        # This function now needs to handle the box constraint, which will be a dict
+        # and doesn't have a .project method. We'll handle it separately.
+        compatible_component_sets = []
+        for comp_set in convex_component_sets:
+            if isinstance(comp_set, ConvexBall) and comp_set.dim == action_dim_of_current:
+                compatible_component_sets.append(comp_set)
+            elif isinstance(comp_set, dict) and comp_set.get('type') == 'box':
+                compatible_component_sets.append(comp_set)  # Add the box dict
+        # ### MODIFICATION END ###
 
         if not compatible_component_sets:
             final_projected_actions_list.append(current_single_action)
@@ -576,10 +607,19 @@ def hard_project_to_union_of_convex_sets(action_raw: torch.Tensor, convex_compon
         is_already_inside_a_set = False
         for comp_set in compatible_component_sets:
             try:
-                if comp_set.violation(current_single_action).item() <= TOL:
+                # ### MODIFICATION START ###
+                # Build cfunc on the fly for dict-based constraints
+                if isinstance(comp_set, dict):
+                    cfunc = build_cfunc_from_raw_data(comp_set, current_single_action.device)
+                    violation = cfunc(current_single_action)
+                else:  # Original logic for ConvexBall objects
+                    violation = comp_set.violation(current_single_action)
+
+                if violation.item() <= TOL:
                     final_projected_actions_list.append(current_single_action);
                     is_already_inside_a_set = True;
                     break
+                # ### MODIFICATION END ###
             except Exception as e_viol_check:
                 pass
 
@@ -592,15 +632,29 @@ def hard_project_to_union_of_convex_sets(action_raw: torch.Tensor, convex_compon
 
         for comp_set in compatible_component_sets:
             try:
-                projected_point_onto_comp = comp_set.project(current_single_action);
+                # ### MODIFICATION START ###
+                # Handle projection for box constraint
+                if isinstance(comp_set, dict) and comp_set.get('type') == 'box':
+                    low = torch.tensor(comp_set['params']['low'], device=device)
+                    high = torch.tensor(comp_set['params']['high'], device=device)
+                    projected_point_onto_comp = torch.clamp(current_single_action, min=low, max=high)
+                else:  # Original logic for ConvexBall
+                    projected_point_onto_comp = comp_set.project(current_single_action);
+                # ### MODIFICATION END ###
+
                 candidate_projections.append(projected_point_onto_comp);
                 squared_distances_to_original.append(
                     torch.sum((current_single_action - projected_point_onto_comp) ** 2)
                 );
                 projection_succeeded_for_any_component = True
             except Exception as e_proj_comp:
+                center_str = 'N/A'
+                if isinstance(comp_set, ConvexBall):
+                    center_str = str(comp_set.c.cpu().numpy())
+                elif isinstance(comp_set, dict):
+                    center_str = f"Box[{comp_set['params']['low']}, {comp_set['params']['high']}]"
                 print(
-                    f"Warning: HardProj - Projection failed for component set (center: {getattr(comp_set, 'c', 'N/A').cpu().numpy() if hasattr(comp_set, 'c') else 'N/A'}, radius: {getattr(comp_set, 'r', 'N/A')}) with action {current_single_action.cpu().numpy()}. Error: {e_proj_comp}")
+                    f"Warning: HardProj - Projection failed for component set ({center_str}) with action {current_single_action.cpu().numpy()}. Error: {e_proj_comp}")
                 pass
 
         if not projection_succeeded_for_any_component or not candidate_projections:
@@ -940,7 +994,6 @@ N_EVAL_EPISODES_PERIODIC = 5
 def run_periodic_evaluation(
         current_episode_num: int,
         eval_constraint_raw: Dict[str, Any],
-        eval_constraint_name: str,
         p_embed_net_hard: StateConstraintEmbedder,
         p_embed_net_lagrange: StateConstraintEmbedder,
         p_hard_policy: HardProjPolicy,
@@ -950,19 +1003,22 @@ def run_periodic_evaluation(
         device: torch.device,
         num_eval_episodes: int,
         env_id_eval: str,
-        action_dim_eval: int,
         n_samples_encoding: int,
         sampling_range_encoding: Tuple[float, float]
 ):
+    eval_constraint_name = eval_constraint_raw['name']
     print(f"--- Running Periodic Evaluation at Ep {current_episode_num} for Constraint: {eval_constraint_name} ---")
 
     policy_types_to_eval = ['hard', 'lagrange', 'ppo', 'random']
     results_rewards = {ptype: [] for ptype in policy_types_to_eval}
     results_sats = {ptype: [] for ptype in policy_types_to_eval}
 
-    e_constraint_eval_periodic = new_encode_constraint(
-        eval_constraint_raw, n_samples_encoding, sampling_range_encoding, device
-    ).unsqueeze(0)
+    # Encode the constraint only if it's not a PPO/random policy test
+    e_constraint_eval_periodic = None
+    if eval_constraint_raw.get('type') != 'unconstrained':
+        e_constraint_eval_periodic = new_encode_constraint(
+            eval_constraint_raw, n_samples_encoding, sampling_range_encoding, device
+        ).unsqueeze(0)
 
     policy_modules_map = {
         'hard': p_hard_policy,
@@ -984,7 +1040,7 @@ def run_periodic_evaluation(
             done_eval, truncated_eval = False, False
             episode_reward_eval, num_steps_eval, num_satisfied_steps_eval = 0.0, 0, 0
 
-            max_episode_length_eval = getattr(env_eval.spec, 'max_episode_steps', 200)
+            max_episode_length_eval = getattr(env_eval.spec, 'max_episode_steps', 1000)
 
             for _step in range(max_episode_length_eval):
                 if done_eval or truncated_eval: break
@@ -992,6 +1048,8 @@ def run_periodic_evaluation(
                 obs_tensor_eval = torch.tensor(obs_np, dtype=torch.float32, device=device).unsqueeze(0)
                 action_from_policy_eval: torch.Tensor
                 action_to_execute_eval: torch.Tensor
+
+                constraint_sets_for_eval = eval_constraint_raw.get('sets', [])
 
                 with torch.no_grad():
                     if policy_name == 'random':
@@ -1001,14 +1059,10 @@ def run_periodic_evaluation(
                         mu_eval, _, _ = current_policy_module(obs_tensor_eval)
                         action_from_policy_eval = mu_eval[0] if mu_eval.ndim > 1 else mu_eval
                         action_to_execute_eval = action_from_policy_eval
-                    else:
-                        if policy_name == 'hard':
-                            joint_embedding_eval = p_embed_net_hard(obs_tensor_eval, e_constraint_eval_periodic)[0]
-                        elif policy_name == 'lagrange':
-                            joint_embedding_eval = p_embed_net_lagrange(obs_tensor_eval, e_constraint_eval_periodic)[0]
-                        else:
-                            joint_embedding_eval = p_embed_net_hard(obs_tensor_eval, e_constraint_eval_periodic)[0]
-
+                    else:  # hard and lagrange
+                        joint_embedding_eval = p_embed_net_hard(obs_tensor_eval, e_constraint_eval_periodic)[
+                            0] if policy_name == 'hard' else \
+                            p_embed_net_lagrange(obs_tensor_eval, e_constraint_eval_periodic)[0]
                         mu_eval, _, _ = current_policy_module(joint_embedding_eval.unsqueeze(0))
                         action_from_policy_eval = mu_eval[0] if mu_eval.ndim > 1 else mu_eval
 
@@ -1016,23 +1070,18 @@ def run_periodic_evaluation(
                             if torch.isnan(action_from_policy_eval).any():
                                 action_to_execute_eval = torch.nan_to_num(action_from_policy_eval)
                             else:
-                                if eval_constraint_raw.get('convex', False):
-                                    if eval_constraint_raw.get('sets'):
-                                        action_to_execute_eval = eval_constraint_raw['sets'][0].project(
-                                            action_from_policy_eval)
-                                    else:
-                                        action_to_execute_eval = action_from_policy_eval
-                                else:
-                                    action_after_sdf_eval = action_from_policy_eval
+                                action_after_sdf_eval = action_from_policy_eval
+                                if not eval_constraint_raw.get('convex', False):
                                     for _iter_sdf in range(3):
                                         action_after_sdf_eval = p_sdf_proj_operator(action_after_sdf_eval,
-                                                                                    eval_constraint_raw.get('sets', []))
-                                    if torch.isnan(action_after_sdf_eval).any():
-                                        action_to_execute_eval = torch.nan_to_num(action_after_sdf_eval)
-                                    else:
-                                        action_to_execute_eval = hard_project_to_union_of_convex_sets(
-                                            action_after_sdf_eval, eval_constraint_raw.get('sets', []), device
-                                        )
+                                                                                    constraint_sets_for_eval)
+
+                                if torch.isnan(action_after_sdf_eval).any():
+                                    action_to_execute_eval = torch.nan_to_num(action_after_sdf_eval)
+                                else:
+                                    action_to_execute_eval = hard_project_to_union_of_convex_sets(
+                                        action_after_sdf_eval, constraint_sets_for_eval, device
+                                    )
                         else:  # Lagrange policy
                             action_to_execute_eval = action_from_policy_eval
 
@@ -1045,7 +1094,6 @@ def run_periodic_evaluation(
                     env_eval.action_space.low,
                     env_eval.action_space.high
                 )
-                action_clamped_tensor = torch.from_numpy(action_clamped_np).to(device)
 
                 obs_next_np, reward_val, done_eval, truncated_eval, _ = env_eval.step(action_clamped_np)
                 episode_reward_eval += reward_val
@@ -1054,28 +1102,30 @@ def run_periodic_evaluation(
 
                 action_to_check_violation_final = action_to_execute_eval.to(device)
 
-                if policy_name != 'random':
-                    if torch.isnan(action_to_check_violation_final).any():
-                        pass
-                    elif not eval_constraint_raw.get('sets'):
-                        num_satisfied_steps_eval += 1
-                    else:
-                        violation_values_list_final = [
-                            s_set.violation(action_to_check_violation_final) for s_set in eval_constraint_raw['sets']
-                            if hasattr(s_set, 'violation')
-                        ]
-                        if not violation_values_list_final:
-                            num_satisfied_steps_eval += 1
+                # Check satisfaction for ALL policies against the current constraint
+                if not constraint_sets_for_eval:  # If no constraint (e.g., for a PPO-only plot), consider it satisfied
+                    num_satisfied_steps_eval += 1
+                elif torch.isnan(action_to_check_violation_final).any():
+                    pass
+                else:
+                    is_satisfied_this_step = False
+                    for s_set in constraint_sets_for_eval:
+                        # Handle both object and dict representations
+                        if isinstance(s_set, dict):
+                            cfunc = build_cfunc_from_raw_data(s_set, action_to_check_violation_final.device)
+                            violation = cfunc(action_to_check_violation_final)
                         else:
-                            final_violation_for_step = torch.min(torch.stack(violation_values_list_final));
-                            if final_violation_for_step.item() <= TOL:
-                                num_satisfied_steps_eval += 1
+                            violation = s_set.violation(action_to_check_violation_final)
+
+                        if violation.item() <= TOL:
+                            is_satisfied_this_step = True
+                            break  # One satisfied component is enough for a union
+
+                    if is_satisfied_this_step:
+                        num_satisfied_steps_eval += 1
 
             results_rewards[policy_name].append(episode_reward_eval)
-            if policy_name != 'random':
-                results_sats[policy_name].append(num_satisfied_steps_eval / max(1, num_steps_eval))
-            else:
-                results_sats[policy_name].append(0.0)
+            results_sats[policy_name].append(num_satisfied_steps_eval / max(1, num_steps_eval))
             env_eval.close()
 
     if p_embed_net_hard: p_embed_net_hard.train()
@@ -1089,7 +1139,7 @@ def run_periodic_evaluation(
     print(f"--- Periodic Evaluation Results for {eval_constraint_name} (Ep: {current_episode_num}) ---")
     for p_name_log in policy_types_to_eval:
         print(
-            f"  {p_name_log.capitalize()}: Avg Reward: {avg_rewards_eval[p_name_log]:.2f}, Avg Sat Rate: {avg_sats_eval[p_name_log]:.3f}")
+            f"  {p_name_log.capitalize():<10}: Avg Reward: {avg_rewards_eval[p_name_log]:.2f}, Avg Sat Rate: {avg_sats_eval[p_name_log]:.3f}")
     print("---------------------------------------------------------------")
     return avg_rewards_eval, avg_sats_eval
 
@@ -1105,63 +1155,74 @@ def train_loop(episodes=50, batch_steps=128, clip_eps=0.2, ppo_epochs=2, mb_size
     CURRICULUM_LAMBDA_DIFFICULTY = 1.0
     CURRICULUM_ETA_UPDATE_RATE = 0.1
 
-    max_episode_len_train = getattr(env_h.spec, 'max_episode_steps', 200)
+    max_episode_len_train = getattr(env_h.spec, 'max_episode_steps', 1000)
 
     # ##########################################################################
-    # MODIFIED: Changed the periodic test constraint to a "good" one.
-    # This new constraint is a large ball centered at 0, which for InvertedPendulum
-    # contains the optimal actions for balancing, allowing for a higher reward ceiling.
+    # ### MODIFICATION START: Define the 4 specific test cases for evaluation ###
     # ##########################################################################
     action_dim_for_test_constraints = max(1, PPO_ACTION_DIM)
-    good_center_periodic = np.array([0.0] * action_dim_for_test_constraints, dtype=np.float32)
-    good_radius_periodic = 1.5
-    test_constraint_1_raw_periodic = {
-        'name': "Periodic_Test_GOOD_Convex_Ball", 'type': 'l2_norm',
-        'params': {'center': good_center_periodic, 'radius': good_radius_periodic},
+
+    # Test Case 1: Benevolent Constraint (Sanity Check)
+    test_case_1_benevolent = {
+        'name': "Test 1: Benevolent Constraint", 'type': 'l2_norm',
+        'params': {'center': np.array([0.0] * action_dim_for_test_constraints), 'radius': 2.0},
         'convex': True,
-        'sets': [ConvexBall(good_center_periodic, good_radius_periodic)],
+        'sets': [ConvexBall(np.array([0.0] * action_dim_for_test_constraints), 2.0)],
         'action_dim': PPO_ACTION_DIM
     }
 
-    if PPO_ACTION_DIM == 1:
-        c2p_test_1 = np.array([-1.0], dtype=np.float32);
-        r2p_test_1 = 0.25
-        c2p_test_2 = np.array([0.0], dtype=np.float32);
-        r2p_test_2 = 0.25
-        c2p_test_3 = np.array([1.0], dtype=np.float32);
-        r2p_test_3 = 0.25
-    else:
-        c2p_test_1 = np.array([-0.8] * action_dim_for_test_constraints, dtype=np.float32);
-        r2p_test_1 = 0.3
-        c2p_test_2 = np.zeros(action_dim_for_test_constraints, dtype=np.float32);
-        r2p_test_2 = 0.3
-        c2p_test_3 = np.array([0.8] * action_dim_for_test_constraints, dtype=np.float32);
-        r2p_test_3 = 0.3
-
-    c2p_final_1 = c2p_test_1 if PPO_ACTION_DIM > 0 else np.array([c2p_test_1.item()])
-    c2p_final_2 = c2p_test_2 if PPO_ACTION_DIM > 0 else np.array([c2p_test_2.item()])
-    c2p_final_3 = c2p_test_3 if PPO_ACTION_DIM > 0 else np.array([c2p_test_3.item()])
-
-    comp1_periodic_test = {'type': 'l2_norm', 'params': {'center': c2p_final_1, 'radius': r2p_test_1},
-                           'action_dim': PPO_ACTION_DIM}
-    comp2_periodic_test = {'type': 'l2_norm', 'params': {'center': c2p_final_2, 'radius': r2p_test_2},
-                           'action_dim': PPO_ACTION_DIM}
-    comp3_periodic_test = {'type': 'l2_norm', 'params': {'center': c2p_final_3, 'radius': r2p_test_3},
-                           'action_dim': PPO_ACTION_DIM}
-    test_constraint_2_raw_periodic = {
-        'name': "Periodic_Test_NonConvex_3Balls", 'type': 'union',
-        'params': {'components': [comp1_periodic_test, comp2_periodic_test, comp3_periodic_test]},
-        'convex': False,
-        'sets': [ConvexBall(c2p_final_1, r2p_test_1), ConvexBall(c2p_final_2, r2p_test_2),
-                 ConvexBall(c2p_final_3, r2p_test_3)],
+    # Test Case 2: Simple Banishment (Basic Projection)
+    test_case_2_banishment = {
+        'name': "Test 2: Simple Banishment", 'type': 'l2_norm',
+        'params': {'center': np.array([1.5] * action_dim_for_test_constraints), 'radius': 0.2},
+        'convex': True,
+        'sets': [ConvexBall(np.array([1.5] * action_dim_for_test_constraints), 0.2)],
         'action_dim': PPO_ACTION_DIM
+    }
+
+    # Test Case 3: Fork in the Road (Non-Convex Decision)
+    c1 = np.array([-0.8] * action_dim_for_test_constraints)  # Better choice
+    r1 = 0.3
+    c2 = np.array([2.0] * action_dim_for_test_constraints)  # Worse choice
+    r2 = 0.3
+    test_case_3_fork = {
+        'name': "Test 3: Fork in the Road", 'type': 'union',
+        'params': {'components': [
+            {'type': 'l2_norm', 'params': {'center': c1, 'radius': r1}},
+            {'type': 'l2_norm', 'params': {'center': c2, 'radius': r2}}
+        ]},
+        'convex': False,
+        'sets': [ConvexBall(c1, r1), ConvexBall(c2, r2)],
+        'action_dim': PPO_ACTION_DIM
+    }
+
+    # Test Case 4: Unseen Geometry (Generalization to Box)
+    test_case_4_unseen_geom = {
+        'name': "Test 4: Unseen Geometry (Box)", 'type': 'box',
+        'params': {'low': np.array([0.5] * action_dim_for_test_constraints),
+                   'high': np.array([1.5] * action_dim_for_test_constraints)},
+        'convex': True,
+        # Pass the dict itself in 'sets' so hard_project can handle it
+        'sets': [{'type': 'box', 'params': {'low': np.array([0.5] * action_dim_for_test_constraints),
+                                            'high': np.array([1.5] * action_dim_for_test_constraints)}}],
+        'action_dim': PPO_ACTION_DIM
+    }
+
+    evaluation_test_cases = {
+        "test1_benevolent": test_case_1_benevolent,
+        "test2_banishment": test_case_2_banishment,
+        "test3_fork": test_case_3_fork,
+        "test4_unseen_geom": test_case_4_unseen_geom,
     }
 
     eval_log = {
         'episodes': [],
-        'test1_convex': {ptype: {'R': [], 'S': []} for ptype in ['hard', 'lagrange', 'ppo', 'random']},
-        'test2_nonconvex': {ptype: {'R': [], 'S': []} for ptype in ['hard', 'lagrange', 'ppo', 'random']}
+        **{key: {ptype: {'R': [], 'S': []} for ptype in ['hard', 'lagrange', 'ppo', 'random']} for key in
+           evaluation_test_cases.keys()}
     }
+    # ##########################################################################
+    # ### MODIFICATION END ###
+    # ##########################################################################
 
     for ep in range(episodes):
         current_training_constraint_raw = sampler.sample()
@@ -1208,18 +1269,18 @@ def train_loop(episodes=50, batch_steps=128, clip_eps=0.2, ppo_epochs=2, mb_size
                     action_policy_raw_h = torch.nan_to_num(action_policy_raw_h)
                     action_to_measure_correction_from_h = action_policy_raw_h
 
-                if current_training_constraint_raw['convex']:
-                    projected_convex_h = current_training_constraint_raw['sets'][0].project(action_policy_raw_h)
-                    action_to_execute_h = projected_convex_h
-                else:
-                    action_after_sdf_h = sdf_proj_operator(action_policy_raw_h, current_training_constraint_raw['sets'])
-                    if torch.isnan(action_after_sdf_h).any():
-                        action_after_sdf_h = torch.nan_to_num(action_after_sdf_h)
+                action_after_sdf_h = action_policy_raw_h
+                if not current_training_constraint_raw['convex']:
+                    action_after_sdf_h = sdf_proj_operator(action_policy_raw_h,
+                                                           current_training_constraint_raw['sets'])
 
-                    action_to_measure_correction_from_h = action_after_sdf_h
-                    action_to_execute_h = hard_project_to_union_of_convex_sets(
-                        action_after_sdf_h, current_training_constraint_raw['sets'], PPO_DEVICE
-                    )
+                if torch.isnan(action_after_sdf_h).any():
+                    action_after_sdf_h = torch.nan_to_num(action_after_sdf_h)
+
+                action_to_measure_correction_from_h = action_after_sdf_h
+                action_to_execute_h = hard_project_to_union_of_convex_sets(
+                    action_after_sdf_h, current_training_constraint_raw['sets'], PPO_DEVICE
+                )
 
                 if torch.isnan(action_to_execute_h).any():
                     action_to_execute_h = torch.nan_to_num(action_to_execute_h)
@@ -1356,157 +1417,50 @@ def train_loop(episodes=50, batch_steps=128, clip_eps=0.2, ppo_epochs=2, mb_size
                 f"R_u:{ep_reward_u:6.1f},S_u:{sat_rate_u:.2f}")
             sampler.update_weights(eta=CURRICULUM_ETA_UPDATE_RATE, difficulty_lambda=CURRICULUM_LAMBDA_DIFFICULTY)
 
+        # ##########################################################################
+        # ### MODIFICATION START: Iterate over all test cases for evaluation ###
+        # ##########################################################################
         if (ep + 1) % EVAL_FREQ == 0 or ep == episodes - 1:
             eval_log['episodes'].append(ep + 1)
 
-            avg_rewards_t1, avg_sats_t1 = run_periodic_evaluation(
-                ep + 1, test_constraint_1_raw_periodic, "TestConstraint1_Convex",
-                embed_net_hard, embed_net_lagrange, hard_policy, lagrange_policy, ppo_plain, sdf_proj_operator,
-                PPO_DEVICE, N_EVAL_EPISODES_PERIODIC, env_id, PPO_ACTION_DIM,
-                N_SAMPLES_FOR_CONSTRAINT_ENCODING, SAMPLING_RANGE_FOR_ENCODING
-            )
-            for p_key_eval in ['hard', 'lagrange', 'ppo', 'random']:
-                eval_log['test1_convex'][p_key_eval]['R'].append(avg_rewards_t1[p_key_eval])
-                eval_log['test1_convex'][p_key_eval]['S'].append(avg_sats_t1[p_key_eval])
-
-            avg_rewards_t2, avg_sats_t2 = run_periodic_evaluation(
-                ep + 1, test_constraint_2_raw_periodic, "TestConstraint2_NonConvex",
-                embed_net_hard, embed_net_lagrange, hard_policy, lagrange_policy, ppo_plain, sdf_proj_operator,
-                PPO_DEVICE, N_EVAL_EPISODES_PERIODIC, env_id, PPO_ACTION_DIM,
-                N_SAMPLES_FOR_CONSTRAINT_ENCODING, SAMPLING_RANGE_FOR_ENCODING
-            )
-            for p_key_eval in ['hard', 'lagrange', 'ppo', 'random']:
-                eval_log['test2_nonconvex'][p_key_eval]['R'].append(avg_rewards_t2[p_key_eval])
-                eval_log['test2_nonconvex'][p_key_eval]['S'].append(avg_sats_t2[p_key_eval])
+            for test_key, test_constraint_raw in evaluation_test_cases.items():
+                avg_rewards, avg_sats = run_periodic_evaluation(
+                    current_episode_num=ep + 1,
+                    eval_constraint_raw=test_constraint_raw,
+                    p_embed_net_hard=embed_net_hard,
+                    p_embed_net_lagrange=embed_net_lagrange,
+                    p_hard_policy=hard_policy,
+                    p_lagrange_policy=lagrange_policy,
+                    p_ppo_plain=ppo_plain,
+                    p_sdf_proj_operator=sdf_proj_operator,
+                    device=PPO_DEVICE,
+                    num_eval_episodes=N_EVAL_EPISODES_PERIODIC,
+                    env_id_eval=env_id,
+                    n_samples_encoding=N_SAMPLES_FOR_CONSTRAINT_ENCODING,
+                    sampling_range_encoding=SAMPLING_RANGE_FOR_ENCODING
+                )
+                for p_key_eval in ['hard', 'lagrange', 'ppo', 'random']:
+                    eval_log[test_key][p_key_eval]['R'].append(avg_rewards[p_key_eval])
+                    eval_log[test_key][p_key_eval]['S'].append(avg_sats[p_key_eval])
+        # ##########################################################################
+        # ### MODIFICATION END ###
+        # ##########################################################################
 
     env_h.close();
     env_p.close();
     env_u.close();
-    return eval_log
-
-
-def test_baselines(raw_constraint_data_test, p_embed_net_hard, p_embed_net_lagrange, p_hard_policy, p_lagrange_policy,
-                   p_ppo_plain, p_sdf_proj_operator, num_test_episodes=10):
-    policy_modes_to_test = ['hard', 'pen', 'ppo', 'rand'];
-
-    avg_rewards_all_modes = {mode: [] for mode in policy_modes_to_test};
-    avg_sats_all_modes = {mode: [] for mode in policy_modes_to_test}
-
-    p_embed_net_hard.eval();
-    p_embed_net_lagrange.eval();
-    p_hard_policy.eval();
-    p_lagrange_policy.eval();
-    p_ppo_plain.eval()
-
-    e_constraint_for_final_test = new_encode_constraint(
-        raw_constraint_data_test, N_SAMPLES_FOR_CONSTRAINT_ENCODING,
-        SAMPLING_RANGE_FOR_ENCODING, PPO_DEVICE
-    ).unsqueeze(0)
-
-    for policy_mode_name in policy_modes_to_test:
-        for _ep_idx in range(num_test_episodes):
-            env_test = gym.make(PPO_ENV_ID);
-            obs_np_test, _ = env_test.reset();
-            done_test, truncated_test = False, False;
-            ep_reward_test, ep_satisfied_steps_test, ep_num_steps_test = 0.0, 0, 0
-
-            max_steps_test = getattr(env_test.spec, 'max_episode_steps', 200)
-
-            for _step_idx in range(max_steps_test):
-                if done_test or truncated_test: break
-
-                action_to_execute_test: torch.Tensor
-                obs_tensor_test = torch.tensor(obs_np_test, dtype=torch.float32, device=PPO_DEVICE).unsqueeze(0)
-
-                with torch.no_grad():
-                    if policy_mode_name == 'rand':
-                        action_to_execute_test = torch.from_numpy(env_test.action_space.sample()).float().to(PPO_DEVICE)
-                    elif policy_mode_name == 'ppo':
-                        mu_u_test, _, _ = p_ppo_plain(obs_tensor_test);
-                        action_to_execute_test = mu_u_test[0] if mu_u_test.ndim > 1 else mu_u_test
-                    else:
-                        if policy_mode_name == 'pen':  # pen == lagrange
-                            joint_embedding_test = p_embed_net_lagrange(obs_tensor_test, e_constraint_for_final_test)[
-                                0].detach()
-                            mu_p_test, _, _ = p_lagrange_policy(joint_embedding_test.unsqueeze(0));
-                            action_to_execute_test = mu_p_test[0] if mu_p_test.ndim > 1 else mu_p_test
-                        elif policy_mode_name == 'hard':
-                            joint_embedding_test = p_embed_net_hard(obs_tensor_test, e_constraint_for_final_test)[
-                                0].detach()
-                            mu_h_test, _, _ = p_hard_policy(joint_embedding_test.unsqueeze(0));
-                            action_raw_h_test = mu_h_test[0] if mu_h_test.ndim > 1 else mu_h_test
-
-                            if torch.isnan(action_raw_h_test).any():
-                                action_raw_h_test = torch.nan_to_num(action_raw_h_test)
-
-                            if raw_constraint_data_test.get('convex', False):
-                                if raw_constraint_data_test.get('sets'):
-                                    action_to_execute_test = raw_constraint_data_test['sets'][0].project(
-                                        action_raw_h_test)
-                                else:
-                                    action_to_execute_test = action_raw_h_test
-                            else:
-                                action_sdf_iter_test = action_raw_h_test
-                                for _iter_sdf in range(3):
-                                    action_sdf_iter_test = p_sdf_proj_operator(
-                                        action_sdf_iter_test, raw_constraint_data_test.get('sets', [])
-                                    )
-                                if torch.isnan(action_sdf_iter_test).any():
-                                    action_sdf_iter_test = torch.nan_to_num(action_sdf_iter_test)
-                                action_to_execute_test = hard_project_to_union_of_convex_sets(
-                                    action_sdf_iter_test, raw_constraint_data_test.get('sets', []), PPO_DEVICE
-                                )
-                if torch.isnan(action_to_execute_test).any():
-                    action_to_execute_test = torch.nan_to_num(action_to_execute_test)
-
-                action_np_clamped_test = np.clip(
-                    action_to_execute_test.detach().cpu().numpy().flatten(),
-                    env_test.action_space.low, env_test.action_space.high
-                )
-
-                obs_next_np_test, reward_val_test, done_test, truncated_test, _ = env_test.step(action_np_clamped_test);
-                ep_reward_test += reward_val_test;
-                ep_num_steps_test += 1;
-
-                action_for_violation_check = action_to_execute_test.to(PPO_DEVICE)
-                if policy_mode_name != 'rand':
-                    if torch.isnan(action_for_violation_check).any():
-                        pass
-                    elif not raw_constraint_data_test.get('sets'):
-                        ep_satisfied_steps_test += 1
-                    else:
-                        constraint_sets_for_test = raw_constraint_data_test.get('sets', [])
-                        viol_list_final_test = [
-                            s.violation(action_for_violation_check) for s in constraint_sets_for_test if
-                            hasattr(s, 'violation')
-                        ]
-                        if not viol_list_final_test:
-                            ep_satisfied_steps_test += 1
-                        else:
-                            min_viol_final_test = torch.min(torch.stack(viol_list_final_test)).item()
-                            if min_viol_final_test <= TOL: ep_satisfied_steps_test += 1
-                obs_np_test = obs_next_np_test
-
-            avg_rewards_all_modes[policy_mode_name].append(ep_reward_test);
-            avg_sats_all_modes[policy_mode_name].append(
-                ep_satisfied_steps_test / max(1, ep_num_steps_test) if policy_mode_name != 'rand' else 0.0)
-        env_test.close()
-
-    p_embed_net_hard.train();
-    p_embed_net_lagrange.train();
-    p_hard_policy.train();
-    p_lagrange_policy.train();
-    p_ppo_plain.train()
-
-    final_mean_rewards = {mode: np.mean(res_list) if res_list else 0.0 for mode, res_list in
-                          avg_rewards_all_modes.items()}
-    final_mean_sats = {mode: np.mean(res_list) if res_list else 0.0 for mode, res_list in avg_sats_all_modes.items()}
-    return final_mean_rewards, final_mean_sats
+    # ##########################################################################
+    # ### MODIFICATION START: Return test case definitions for plotting ###
+    # ##########################################################################
+    return eval_log, evaluation_test_cases
+    # ##########################################################################
+    # ### MODIFICATION END ###
+    # ##########################################################################
 
 
 def main():
-    print(f"--- Starting PPO Main Script (Periodic Eval, Diagnostics, Plotting Changes) ---")
-    num_training_episodes = 5000
+    print(f"--- Starting PPO Main Script ---")
+    num_training_episodes = 5000 # Can be adjusted
     training_batch_steps = 256;
     ppo_mini_batch_size = 32;
     num_ppo_update_epochs = 4;
@@ -1514,154 +1468,93 @@ def main():
     print(f"Running training for {num_training_episodes} episodes...")
     training_start_time = time.time();
 
-    evaluation_log_results = train_loop(
+    # ##########################################################################
+    # ### MODIFICATION START: Receive test case definitions from train_loop ###
+    # ##########################################################################
+    evaluation_log_results, evaluation_test_cases = train_loop(
         episodes=num_training_episodes, batch_steps=training_batch_steps,
         mb_size=ppo_mini_batch_size, ppo_epochs=num_ppo_update_epochs
     )
+    # ##########################################################################
+    # ### MODIFICATION END ###
+    # ##########################################################################
 
     print(f"Training loop finished in {(time.time() - training_start_time):.2f} seconds.")
 
+    # ##########################################################################
+    # ### MODIFICATION START: Plot each test case in a separate figure ###
+    # ##########################################################################
     if not evaluation_log_results or not evaluation_log_results['episodes']:
         print("No evaluation data collected during training. Skipping plots.")
     else:
-        plt.figure(figsize=(14, 10))
         evaluation_episodes_axis = evaluation_log_results['episodes']
 
-        plot_policy_keys = ['hard', 'lagrange', 'random']
-        plot_policy_labels = {'hard': 'Hard+Proj', 'lagrange': 'Lagrange', 'random': 'Random'}
-        plot_policy_markers = {'hard': 'o', 'lagrange': 'x', 'random': '^'}
-        plot_policy_linestyles = {'hard': '-', 'lagrange': '--', 'random': '-.'}
+        # Define policies to plot and their styles
+        plot_policy_keys = ['hard', 'lagrange', 'ppo', 'random']
+        plot_policy_labels = {'hard': 'Hard+Proj', 'lagrange': 'Lagrange', 'ppo': 'PPO (Unconstrained)',
+                              'random': 'Random'}
+        plot_policy_markers = {'hard': 'o', 'lagrange': 'x', 'ppo': 's', 'random': '^'}
+        plot_policy_linestyles = {'hard': '-', 'lagrange': '--', 'ppo': ':', 'random': '-.'}
 
-        plt.subplot(2, 2, 1)
-        for p_key in plot_policy_keys:
-            if p_key in evaluation_log_results['test1_convex'] and evaluation_log_results['test1_convex'][p_key]['R']:
-                plt.plot(evaluation_episodes_axis, evaluation_log_results['test1_convex'][p_key]['R'],
-                         label=plot_policy_labels[p_key], marker=plot_policy_markers[p_key],
-                         linestyle=plot_policy_linestyles[p_key])
-        plt.title(f"Reward on Test Constraint 1 (Convex)")
-        plt.xlabel("Training Episodes");
-        plt.ylabel("Avg Reward (Periodic Eval)");
-        plt.legend();
-        plt.grid(True)
+        # Get the keys for the test cases used in the log
+        test_case_keys = [key for key in evaluation_log_results if key != 'episodes']
 
-        plt.subplot(2, 2, 2)
-        for p_key in plot_policy_keys:
-            if p_key in evaluation_log_results['test1_convex'] and evaluation_log_results['test1_convex'][p_key]['S']:
-                plt.plot(evaluation_episodes_axis, evaluation_log_results['test1_convex'][p_key]['S'],
-                         label=plot_policy_labels[p_key], marker=plot_policy_markers[p_key],
-                         linestyle=plot_policy_linestyles[p_key])
-        plt.title(f"Satisfaction on Test Constraint 1 (Convex)")
-        plt.xlabel("Training Episodes");
-        plt.ylabel("Avg Sat Rate (Periodic Eval)");
-        plt.legend();
-        plt.grid(True);
-        plt.ylim(0, 1.05)
+        # Loop through each test case and create a separate figure
+        for test_key in test_case_keys:
+            # Extract the readable name from the constraint dict using the returned definitions
+            test_case_name = evaluation_test_cases[test_key].get('name', test_key)
 
-        plt.subplot(2, 2, 3)
-        for p_key in plot_policy_keys:
-            if p_key in evaluation_log_results['test2_nonconvex'] and evaluation_log_results['test2_nonconvex'][p_key][
-                'R']:
-                plt.plot(evaluation_episodes_axis, evaluation_log_results['test2_nonconvex'][p_key]['R'],
-                         label=plot_policy_labels[p_key], marker=plot_policy_markers[p_key],
-                         linestyle=plot_policy_linestyles[p_key])
-        plt.title(f"Reward on Test Constraint 2 (Non-Convex)")
-        plt.xlabel("Training Episodes");
-        plt.ylabel("Avg Reward (Periodic Eval)");
-        plt.legend();
-        plt.grid(True)
+            # Create a new figure with two subplots (1 row, 2 columns)
+            fig, (ax_reward, ax_sat) = plt.subplots(1, 2, figsize=(18, 6))
+            fig.suptitle(f'Periodic Evaluation for: {test_case_name}', fontsize=16)
 
-        plt.subplot(2, 2, 4)
-        for p_key in plot_policy_keys:
-            if p_key in evaluation_log_results['test2_nonconvex'] and evaluation_log_results['test2_nonconvex'][p_key][
-                'S']:
-                plt.plot(evaluation_episodes_axis, evaluation_log_results['test2_nonconvex'][p_key]['S'],
-                         label=plot_policy_labels[p_key], marker=plot_policy_markers[p_key],
-                         linestyle=plot_policy_linestyles[p_key])
-        plt.title(f"Satisfaction on Test Constraint 2 (Non-Convex)")
-        plt.xlabel("Training Episodes");
-        plt.ylabel("Avg Sat Rate (Periodic Eval)");
-        plt.legend();
-        plt.grid(True);
-        plt.ylim(0, 1.05)
+            # --- Plot Rewards on the left subplot ---
+            for p_key in plot_policy_keys:
+                if p_key in evaluation_log_results[test_key] and evaluation_log_results[test_key][p_key]['R']:
+                    ax_reward.plot(evaluation_episodes_axis, evaluation_log_results[test_key][p_key]['R'],
+                                   label=plot_policy_labels[p_key], marker=plot_policy_markers[p_key],
+                                   linestyle=plot_policy_linestyles[p_key])
+            ax_reward.set_title("Reward Progression")
+            ax_reward.set_xlabel("Training Episodes")
+            ax_reward.set_ylabel("Log Reward")
+            ax_reward.legend()
+            ax_reward.grid(True)
+            ax_reward.set_yscale('log')  # Set Y-axis to log scale
 
-        plt.tight_layout();
-        plt.show()
+            # --- Plot Satisfaction Rates on the right subplot ---
+            for p_key in plot_policy_keys:
+                if p_key in evaluation_log_results[test_key] and evaluation_log_results[test_key][p_key]['S']:
+                    ax_sat.plot(evaluation_episodes_axis, evaluation_log_results[test_key][p_key]['S'],
+                                label=plot_policy_labels[p_key], marker=plot_policy_markers[p_key],
+                                linestyle=plot_policy_linestyles[p_key])
+            ax_sat.set_title("Satisfaction Rate Progression")
+            ax_sat.set_xlabel("Training Episodes")
+            ax_sat.set_ylabel("Avg Sat Rate")
+            ax_sat.legend()
+            ax_sat.grid(True)
+            ax_sat.set_ylim(-0.05, 1.05)
 
-    print("\n--- Running Final Test Baselines on Trained Policies ---")
-    action_dim_final_test = max(1, PPO_ACTION_DIM)
+            plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+            # Show the current figure. The script will pause here until you close the plot window.
+            plt.show()
 
     # ##########################################################################
-    # MODIFIED: Changed the final evaluation constraint to a "good" one
-    # to verify the hypothesis that the policy can learn if the reward ceiling is high enough.
+    # ### MODIFICATION END ###
     # ##########################################################################
-    good_center_final = np.array([0.0] * action_dim_final_test, dtype=np.float32)
-    good_radius_final = 1.0
-    final_eval_convex_raw = {
-        'name': f"FinalEval_GOOD_Convex_{PPO_ACTION_DIM}D_Ball", 'type': 'l2_norm',
-        'params': {'center': good_center_final, 'radius': good_radius_final}, 'convex': True,
-        'sets': [ConvexBall(good_center_final, good_radius_final)], 'action_dim': PPO_ACTION_DIM
-    }
-
-    c_final_eval_nc1 = np.array([-0.65] * action_dim_final_test, dtype=np.float32);
-    r_final_eval_nc1 = 0.3
-    c_final_eval_nc2 = np.array([0.65] * action_dim_final_test, dtype=np.float32);
-    r_final_eval_nc2 = 0.3
-    comp_final_eval_nc1 = {'type': 'l2_norm', 'params': {'center': c_final_eval_nc1, 'radius': r_final_eval_nc1},
-                           'action_dim': PPO_ACTION_DIM}
-    comp_final_eval_nc2 = {'type': 'l2_norm', 'params': {'center': c_final_eval_nc2, 'radius': r_final_eval_nc2},
-                           'action_dim': PPO_ACTION_DIM}
-    final_eval_nonconvex_raw = {
-        'name': f"FinalEval_NonConvex_{PPO_ACTION_DIM}D_Union2Balls", 'type': 'union',
-        'params': {'components': [comp_final_eval_nc1, comp_final_eval_nc2]}, 'convex': False,
-        'sets': [ConvexBall(c_final_eval_nc1, r_final_eval_nc1), ConvexBall(c_final_eval_nc2, r_final_eval_nc2)],
-        'action_dim': PPO_ACTION_DIM
-    }
-
-    final_evaluation_test_cases = {
-        f"Final Eval Convex ({PPO_ACTION_DIM}D)": final_eval_convex_raw,
-        f"Final Eval Non-Convex ({PPO_ACTION_DIM}D)": final_eval_nonconvex_raw
-    }
-
-    for test_case_name, raw_constraint_data_for_test in final_evaluation_test_cases.items():
-        if 'sets' not in raw_constraint_data_for_test or 'convex' not in raw_constraint_data_for_test:
-            print(f"Skipping final test '{test_case_name}' due to missing 'sets' or 'convex' key.");
-            continue
-
-        final_rewards, final_sats = test_baselines(
-            raw_constraint_data_for_test, embed_net_hard, embed_net_lagrange, hard_policy, lagrange_policy, ppo_plain,
-            sdf_proj_operator,
-            num_test_episodes=20
-        )
-        print(
-            f"\n=== Final Test Results: {test_case_name} (Action Dim: {raw_constraint_data_for_test.get('action_dim')}) ===");
-        print("  Avg Rewards:", {k: f"{v:.2f}" for k, v in final_rewards.items()});
-        print("  Avg Sat Rates:", {k: f"{v:.3f}" for k, v in final_sats.items()})
 
 
 if __name__ == '__main__':
-    print(f"--- PPO Script (Diagnostics, Plotting Changes) Started ---")
-    print(f"PPO Action Dim for Env: {PPO_ACTION_DIM}")
-    print(f"Pretrained Constraint Encoder Action Dim: {PRETRAINED_ACTION_DIM}")
-    print(f"Curriculum Sampler / Constraint Definition Action Dim: {CONSTRAINT_SAMPLER_ACTION_DIM}")
-
+    print(f"--- PPO Script Started ---")
+    # Sanity checks from original code...
     error_messages_main = []
     if CONSTRAINT_SAMPLER_ACTION_DIM != PRETRAINED_ACTION_DIM:
         error_messages_main.append(
-            "CRITICAL WARNING: Mismatch: CONSTRAINT_SAMPLER_ACTION_DIM != PRETRAINED_ACTION_DIM! "
-            "Constraint encoding (token generation) might be incorrect if PRETRAINED_ACTION_DIM is not "
-            "consistent with how constraints are defined by CONSTRAINT_SAMPLER_ACTION_DIM."
-        )
+            "CRITICAL WARNING: Mismatch: CONSTRAINT_SAMPLER_ACTION_DIM != PRETRAINED_ACTION_DIM!")
     if PPO_ACTION_DIM != CONSTRAINT_SAMPLER_ACTION_DIM:
         error_messages_main.append(
-            f"CRITICAL WARNING: Mismatch: PPO_ACTION_DIM ({PPO_ACTION_DIM}) != "
-            f"CONSTRAINT_SAMPLER_ACTION_DIM ({CONSTRAINT_SAMPLER_ACTION_DIM})! "
-            "Policy actions may not be compatible with constraint definitions. This can lead to errors "
-            "in projection and violation calculations."
-        )
-
+            f"CRITICAL WARNING: Mismatch: PPO_ACTION_DIM ({PPO_ACTION_DIM}) != CONSTRAINT_SAMPLER_ACTION_DIM ({CONSTRAINT_SAMPLER_ACTION_DIM})!")
     if PPO_ACTION_DIM == 0:
-        error_messages_main.append(
-            f"CRITICAL WARNING: PPO_ACTION_DIM is 0. This is likely an error in environment setup.")
+        error_messages_main.append(f"CRITICAL WARNING: PPO_ACTION_DIM is 0.")
 
     if error_messages_main:
         for msg in error_messages_main: print(msg)
@@ -1669,4 +1562,4 @@ if __name__ == '__main__':
         exit()
 
     main()
-    print(f"--- PPO Script (Diagnostics, Plotting Changes) Finished ---")
+    print(f"--- PPO Script Finished ---")
